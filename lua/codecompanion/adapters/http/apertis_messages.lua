@@ -1,0 +1,759 @@
+local adapter_utils = require("codecompanion.utils.adapters")
+local log = require("codecompanion.utils.log")
+local transform = require("codecompanion.utils.tool_transformers")
+local can_reason_has_vision = { can_reason = true, has_vision = true }
+local can_reason = { can_reason = true, has_vision = false }
+
+---@class CodeCompanion.HTTPAdapter.ApertisMessages: CodeCompanion.HTTPAdapter
+return {
+  name = "apertis_messages",
+  formatted_name = "Apertis messages API",
+  roles = {
+    llm = "assistant",
+    user = "user",
+  },
+  features = {
+    tokens = true,
+    text = true,
+  },
+  opts = {
+    stream = true,
+    tools = true,
+    vision = true,
+  },
+  url = "https://api.apertis.ai/v1/messages",
+  env = {
+    api_key = "APERTIS_AUTH_TOKEN",
+  },
+  headers = {
+    ["content-type"] = "application/json",
+    ["x-api-key"] = "${api_key}",
+    ["anthropic-version"] = "2023-06-01",
+  },
+  temp = {
+    input_tokens = 0,
+    output_tokens = 0,
+  },
+  available_tools = {
+    ["code_execution"] = {
+      description = "The code execution tool allows Claude to run Bash commands and manipulate files, including writing code, in a secure, sandboxed environment",
+      ---@param self CodeCompanion.HTTPAdapter.ApertisMessages
+      ---@param meta { tools: table }
+      callback = function(self, meta)
+        local beta = self.headers["anthropic-beta"]
+        self.headers["anthropic-beta"] = (beta and (beta .. ",") or "") .. "code-execution-2025-08-25"
+
+        table.insert(meta.tools, {
+          type = "code_execution_20250825",
+          name = "code_execution",
+        })
+      end,
+    },
+    ["memory"] = {
+      description = "Enables Claude to store and retrieve information across conversations through a memory file directory. Claude can create, read, update, and delete files that persist between sessions, allowing it to build knowledge over time without keeping everything in the context window",
+      ---@param self CodeCompanion.HTTPAdapter.ApertisMessages
+      ---@param meta { tools: table }
+      callback = function(self, meta)
+        local beta = self.headers["anthropic-beta"]
+        self.headers["anthropic-beta"] = (beta and (beta .. ",") or "") .. "context-management-2025-06-27"
+
+        table.insert(meta.tools, {
+          type = "memory_20250818",
+          name = "memory",
+        })
+      end,
+      opts = {
+        -- Allow a hybrid tool -> One that also has a client side implementation
+        client_tool = "interactions.chat.tools.memory",
+      },
+    },
+    ["web_fetch"] = {
+      description = "The web fetch tool allows Claude to retrieve full content from specified web pages and PDF documents.",
+      ---@param self CodeCompanion.HTTPAdapter.ApertisMessages
+      ---@param meta { tools: table }
+      callback = function(self, meta)
+        local beta = self.headers["anthropic-beta"]
+        self.headers["anthropic-beta"] = (beta and (beta .. ",") or "") .. "web-fetch-2025-09-10"
+
+        table.insert(meta.tools, {
+          type = "web_fetch_20250910",
+          name = "web_fetch",
+          max_uses = 5,
+        })
+      end,
+    },
+    ["web_search"] = {
+      description = "The web search tool gives Claude direct access to real-time web content, allowing it to answer questions with up-to-date information beyond its knowledge cutoff",
+      ---@param self CodeCompanion.HTTPAdapter.ApertisMessages
+      ---@param meta { tools: table }
+      callback = function(self, meta)
+        table.insert(meta.tools, {
+          type = "web_search_20250305",
+          name = "web_search",
+          max_uses = 5,
+        })
+      end,
+    },
+  },
+  handlers = {
+    ---@param self CodeCompanion.HTTPAdapter
+    ---@return boolean
+    setup = function(self)
+      if self.opts and self.opts.stream then
+        self.parameters.stream = true
+      end
+
+      -- Make sure the individual model options are set
+      local model = self.schema.model.default
+      local model_opts = self.schema.model.choices[model]
+      if model_opts and model_opts.opts then
+        self.opts = vim.tbl_deep_extend("force", self.opts, model_opts.opts)
+        if not model_opts.opts.has_vision then
+          self.opts.vision = false
+        end
+      end
+
+      -- Add the extended output header if enabled
+      if self.temp.extended_output then
+        local beta = self.headers["anthropic-beta"]
+        self.headers["anthropic-beta"] = (beta and (beta .. ",") or "") .. "output-128k-2025-02-19"
+      end
+
+      -- Ref: https://docs.anthropic.com/en/docs/build-with-claude/tool-use/token-efficient-tool-use
+      if self.opts.has_token_efficient_tools then
+        local beta = self.headers["anthropic-beta"]
+        self.headers["anthropic-beta"] = (beta and (beta .. ",") or "") .. "token-efficient-tools-2025-02-19"
+      end
+
+      return true
+    end,
+
+    ---Set the parameters
+    ---@param self CodeCompanion.HTTPAdapter
+    ---@param params table
+    ---@param messages table
+    ---@return table
+    form_parameters = function(self, params, messages)
+      if self.temp.extended_thinking and self.temp.thinking_budget then
+        params.thinking = {
+          type = "enabled",
+          budget_tokens = self.temp.thinking_budget,
+        }
+      end
+      if self.temp.extended_thinking then
+        params.temperature = 1
+      end
+
+      return params
+    end,
+
+    ---Set the format of the role and content for the messages that are sent from the chat buffer to the LLM
+    ---@param self CodeCompanion.HTTPAdapter
+    ---@param messages table Format is: { { role = "user", content = "Your prompt here" } }
+    ---@return table
+    form_messages = function(self, messages)
+      local has_tools = false
+
+      -- 1. Extract and format system messages
+      local system = vim
+        .iter(messages)
+        :filter(function(msg)
+          return msg.role == "system" and msg.content and msg.content ~= ""
+        end)
+        :map(function(msg)
+          return {
+            type = "text",
+            text = msg.content,
+            cache_control = nil, -- To be set later if needed
+          }
+        end)
+        :totable()
+      system = next(system) and system or nil
+
+      -- 2. Remove any system messages from the regular messages
+      messages = vim
+        .iter(messages)
+        :filter(function(msg)
+          return msg.role ~= "system"
+        end)
+        :totable()
+
+      -- 3–7. Clean up, role‐convert, and handle tool calls in one pass
+      messages = vim.tbl_map(function(m)
+        -- 3. Account for any images
+        if m._meta and m._meta.tag == "image" and m.context and m.context.mimetype then
+          if self.opts and self.opts.vision then
+            m.content = {
+              {
+                type = "image",
+                source = {
+                  type = "base64",
+                  media_type = m.context.mimetype,
+                  data = m.content,
+                },
+              },
+            }
+          else
+            -- Remove the message if vision is not supported
+            return nil
+          end
+        end
+
+        -- 4. Remove disallowed keys
+        m = adapter_utils.filter_out_messages({
+          message = m,
+          allowed_words = {
+            "content",
+            "role",
+            "reasoning",
+            "tools",
+          },
+        })
+
+        -- 5. Turn string content into { { type = "text", text } } and add in the reasoning
+        if m.role == self.roles.user or m.role == self.roles.llm then
+          -- Anthropic doesn't allow the user to submit an empty prompt. But
+          -- this can be necessary to prompt the LLM to analyze any tool
+          -- calls and their output
+          if m.role == self.roles.user and m.content == "" then
+            m.content = "<prompt></prompt>"
+          end
+
+          if type(m.content) == "string" then
+            m.content = {
+              { type = "text", text = m.content },
+            }
+          end
+        end
+
+        if m.tools and m.tools.calls and vim.tbl_count(m.tools.calls) > 0 then
+          has_tools = true
+        end
+
+        -- 6. Treat 'tool' role as user and convert tool results to Anthropic format
+        if m.role == "tool" then
+          m.role = self.roles.user
+          -- Convert tool result from CodeCompanion format to Anthropic format
+          if m.tools and m.tools.type == "tool_result" then
+            -- Handle content that might already be in Anthropic's format
+            if type(m.content) == "table" and m.content.type == "tool_result" then
+              -- Already in Anthropic format, keep it as-is but ensure it's in an array
+              m.content = { m.content }
+            else
+              -- Convert from CodeCompanion format to Anthropic format
+              m.content = {
+                {
+                  type = "tool_result",
+                  tool_use_id = m.tools.call_id,
+                  content = m.content,
+                  is_error = m.tools.is_error or false,
+                },
+              }
+            end
+            m.tools = nil
+          end
+        end
+
+        -- 7. Convert any LLM tool_calls into content blocks
+        if has_tools and m.role == self.roles.llm and m.tools and m.tools.calls then
+          m.content = m.content or {}
+          for _, call in ipairs(m.tools.calls) do
+            local args = call["function"].arguments
+            table.insert(m.content, {
+              type = "tool_use",
+              id = call.id,
+              name = call["function"].name,
+              input = args ~= "" and vim.json.decode(args) or vim.empty_dict(),
+            })
+          end
+          m.tools = nil
+        end
+
+        -- 8. If reasoning is present, format it as a content block
+        if m.reasoning and type(m.content) == "table" then
+          -- Ref: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking#how-extended-thinking-works
+          table.insert(m.content, 1, {
+            type = "thinking",
+            thinking = m.reasoning.content,
+            signature = m.reasoning._data.signature,
+          })
+        end
+
+        return m
+      end, messages)
+
+      -- 9. Merge consecutive messages with the same role
+      messages = adapter_utils.merge_messages(messages)
+
+      -- 10. Ensure that any consecutive tool results are merged and text messages are included
+      if has_tools then
+        for _, m in ipairs(messages) do
+          if m.role == self.roles.user and m.content and m.content ~= "" then
+            -- Check if content is already an array of blocks
+            if type(m.content) == "table" and m.content.type then
+              -- If it's a single content block (like a tool_result), make it an array
+              m.content = { m.content }
+            end
+
+            -- Now we can iterate over the content blocks
+            if type(m.content) == "table" and vim.islist(m.content) then
+              local consolidated = {}
+              for _, block in ipairs(m.content) do
+                if block.type == "tool_result" then
+                  local prev = consolidated[#consolidated]
+                  if prev and prev.type == "tool_result" and prev.tool_use_id == block.tool_use_id then
+                    -- Merge consecutive tool results with the same tool_use_id
+                    prev.content = prev.content .. block.content
+                  else
+                    table.insert(consolidated, block)
+                  end
+                else
+                  table.insert(consolidated, block)
+                end
+              end
+              m.content = consolidated
+            end
+          end
+        end
+      end
+
+      -- 11. Enable automatic prompt caching
+      -- Ref: https://platform.claude.com/docs/en/build-with-claude/prompt-caching#automatic-caching
+      return {
+        cache_control = { type = "ephemeral" },
+        system = system,
+        messages = messages,
+      }
+    end,
+
+    ---Form the reasoning output that is stored in the chat buffer
+    ---@param self CodeCompanion.HTTPAdapter
+    ---@param data table The reasoning output from the LLM
+    ---@return nil|{ content: string, _data: table }
+    form_reasoning = function(self, data)
+      local content = vim
+        .iter(data)
+        :map(function(item)
+          return item.content
+        end)
+        :filter(function(content)
+          return content ~= nil
+        end)
+        :join("")
+
+      local signature = data[#data].signature
+
+      return {
+        content = content,
+        _data = {
+          signature = signature,
+        },
+      }
+    end,
+
+    ---Provides the schemas of the tools that are available to the LLM to call
+    ---@param self CodeCompanion.HTTPAdapter
+    ---@param tools table<string, table>
+    ---@return table|nil
+    form_tools = function(self, tools)
+      if not self.opts.tools or not tools then
+        return
+      end
+
+      local transformed = {}
+      for _, tool in pairs(tools) do
+        for _, schema in pairs(tool) do
+          if schema._meta and schema._meta.adapter_tool then
+            if self.available_tools[schema.name] then
+              self.available_tools[schema.name].callback(self, { tools = transformed })
+            end
+          else
+            table.insert(transformed, transform.to_anthropic(schema))
+          end
+        end
+      end
+
+      return { tools = transformed }
+    end,
+
+    ---Returns the number of tokens generated from the LLM
+    ---@param self CodeCompanion.HTTPAdapter
+    ---@param data table The data from the LLM
+    ---@return number|nil
+    tokens = function(self, data)
+      if data then
+        if self.opts.stream then
+          data = adapter_utils.clean_streamed_data(data)
+        else
+          data = data.body
+        end
+        local ok, json = pcall(vim.json.decode, data)
+
+        if ok then
+          if json.type == "message_start" then
+            self.temp.input_tokens = (json.message.usage.input_tokens or 0)
+              + (json.message.usage.cache_creation_input_tokens or 0)
+              + (json.message.usage.cache_read_input_tokens or 0)
+
+            self.temp.output_tokens = json.message.usage.output_tokens or 0
+          elseif json.type == "message_delta" then
+            return (self.temp.input_tokens + self.temp.output_tokens + json.usage.output_tokens)
+          elseif json.type == "message" then
+            return (json.usage.input_tokens + json.usage.output_tokens)
+          end
+        end
+      end
+    end,
+
+    ---Output the data from the API ready for insertion into the chat buffer
+    ---@param self CodeCompanion.HTTPAdapter
+    ---@param data table The streamed JSON data from the API, also formatted by the format_data handler
+    ---@param tools? table The table to write any tool output to
+    ---@return table|nil [status: string, output: table]
+    chat_output = function(self, data, tools)
+      local output = {}
+
+      if self.opts.stream then
+        if type(data) == "string" and string.sub(data, 1, 6) == "event:" then
+          return
+        end
+      end
+
+      if data and data ~= "" then
+        if self.opts.stream then
+          data = adapter_utils.clean_streamed_data(data)
+        else
+          data = data.body
+        end
+
+        local ok, json = pcall(vim.json.decode, data, { luanil = { object = true } })
+
+        if ok then
+          if json.type == "message_start" then
+            output.role = json.message.role
+            output.content = ""
+          elseif json.type == "content_block_start" then
+            if json.content_block.type == "thinking" then
+              output.reasoning = output.reasoning or {}
+              output.reasoning.content = ""
+            end
+            if json.content_block.type == "tool_use" and tools then
+              -- Source: https://docs.anthropic.com/en/docs/build-with-claude/tool-use/overview#single-tool-example
+              table.insert(tools, {
+                _index = json.index,
+                id = json.content_block.id,
+                name = json.content_block.name,
+                input = "",
+              })
+            end
+          elseif json.type == "content_block_delta" then
+            if json.delta.type == "thinking_delta" then
+              output.reasoning = output.reasoning or {}
+              output.reasoning.content = json.delta.thinking
+            elseif json.delta.type == "signature_delta" then
+              output.reasoning = output.reasoning or {}
+              output.reasoning.signature = json.delta.signature
+            else
+              output.content = json.delta.text
+              if json.delta.partial_json and tools then
+                for i, tool in ipairs(tools) do
+                  if tool._index == json.index then
+                    tools[i].input = tools[i].input .. json.delta.partial_json
+                    break
+                  end
+                end
+              end
+            end
+          elseif json.type == "message" then
+            output.role = json.role
+
+            for i, content in ipairs(json.content) do
+              if content.type == "text" then
+                output.content = (output.content or "") .. content.text
+              elseif content.type == "thinking" then
+                output.reasoning = output.reasoning and output.reasoning or {}
+                output.reasoning.content = content.text
+              elseif content.type == "tool_use" and tools then
+                table.insert(tools, {
+                  _index = i,
+                  id = content.id,
+                  name = content.name,
+                  -- Encode the input as JSON to match the partial JSON which comes encoded
+                  input = vim.json.encode(content.input),
+                })
+              end
+            end
+          end
+
+          return {
+            status = "success",
+            output = output,
+          }
+        end
+      end
+    end,
+
+    ---Output the data from the API ready for inlining into the current buffer
+    ---@param self CodeCompanion.HTTPAdapter
+    ---@param data table The streamed JSON data from the API, also formatted by the format_data handler
+    ---@param context? table Useful context about the buffer to inline to
+    ---@return table|nil
+    inline_output = function(self, data, context)
+      if self.opts.stream then
+        return log:error("Inline output is not supported for non-streaming models")
+      end
+
+      if data and data ~= "" then
+        local ok, json = pcall(vim.json.decode, data.body, { luanil = { object = true } })
+
+        if not ok then
+          log:error("Error decoding JSON: %s", data.body)
+          return { status = "error", output = json }
+        end
+
+        if ok then
+          if json.type == "message" then
+            if json.content[2] then
+              return { status = "success", output = json.content[2].text }
+            end
+            return { status = "success", output = json.content[1].text }
+          end
+        end
+      end
+    end,
+
+    tools = {
+      ---Format the LLM's tool calls for inclusion back in the request
+      ---@param self CodeCompanion.HTTPAdapter
+      ---@param tools table The raw tools collected by chat_output
+      ---@return table|nil
+      format_tool_calls = function(self, tools)
+        -- Convert to the OpenAI format
+        local formatted = {}
+        for _, tool in ipairs(tools) do
+          local formatted_tool = {
+            _index = tool._index,
+            id = tool.id,
+            type = "function",
+            ["function"] = {
+              name = tool.name,
+              arguments = tool.input,
+            },
+          }
+          table.insert(formatted, formatted_tool)
+        end
+        return formatted
+      end,
+
+      ---Output the LLM's tool call so we can include it in the messages
+      ---@param self CodeCompanion.HTTPAdapter
+      ---@param tool_call {id: string, function: table, name: string}
+      ---@param output string
+      ---@return table
+      output_response = function(self, tool_call, output)
+        return {
+          -- The role should actually be "user" but we set it to "tool" so that
+          -- in the form_messages handler it's easier to identify and merge
+          -- with other user messages.
+          role = "tool",
+          content = output,
+          tools = {
+            type = "tool_result",
+            call_id = tool_call.id,
+            is_error = false,
+          },
+          -- Chat Buffer option: To tell the chat buffer that this shouldn't be visible
+          opts = { visible = false },
+        }
+      end,
+    },
+
+    ---Function to run when the request has completed. Useful to catch errors
+    ---@param self CodeCompanion.HTTPAdapter
+    ---@param data? table
+    ---@return nil
+    on_exit = function(self, data)
+      if data and data.status >= 400 then
+        log:error("Error %s: %s", data.status, data.body)
+      end
+    end,
+  },
+  schema = {
+    ---@type CodeCompanion.Schema
+    model = {
+      order = 1,
+      mapping = "parameters",
+      type = "enum",
+      desc = "The model that will complete your prompt. See https://apertis.ai/models for additional details and options.",
+      default = "glm-5",
+      choices = {
+        ["qwen3-coder-next"] = { formatted_name = "Qwen3 Coder Next", opts = can_reason_has_vision, },
+        ["qwen3.6-27b"] = { formatted_name = "Qwen3.6-27B (Expensive!)", opts = can_reason_has_vision, },
+        ["qwen3.6-plus"] = { formatted_name = "Qwen3.6 Plus", opts = can_reason_has_vision, },
+        ["qwen3.5-27b"] = { formatted_name = "Qwen3.5-27B", opts = can_reason_has_vision, },
+        ["qwen3.5-flash-02-23"] = { formatted_name = "Qwen3.5-Flash", opts = can_reason_has_vision, },
+        ["qwen3-next-80b-a3b-thinking"] = { formatted_name = "Qwen3 Next 80B A3B Thinking", opts = can_reason, },
+        ["qwen3-30b-a3b-think"] = { formatted_name = "Qwen3 30B A3B Think", opts = can_reason_has_vision, },
+        ["qwen3.5-35b-a3b"] = { formatted_name = "Qwen3.5-35B-A3B", opts = can_reason_has_vision, },
+        ["deepseek-v3.2"] = { formatted_name = "DeepSeek V3.2", opts = can_reason_has_vision, },
+        ["deepseek-v4-pro"] = { formatted_name = "DeepSeek V4 Pro", opts = can_reason_has_vision, },
+        ["deepseek-v4-flash"] = { formatted_name = "DeepSeek V4 Flash", opts = can_reason_has_vision, },
+        ["deepseek-v3.2-speciale"] = { formatted_name = "DeepSeek V3.2 Speciale", opts = can_reason_has_vision, },
+        ["glm-5"] = { formatted_name = "GLM 5", opts = can_reason_has_vision, },
+        ["glm-4.6-thinking"] = { formatted_name = "GLM 4.6 (Thinking)", opts = can_reason_has_vision, },
+        ["glm-4.7-thinking"] = { formatted_name = "GLM 4.7 (Thinking)", opts = can_reason_has_vision, },
+        ["glm-5-turbo"] = { formatted_name = "GLM 5 Turbo", opts = can_reason_has_vision, },
+        ["mimo-v2-pro"] = { formatted_name = "Xiaomi MiMo-V2-Pro", opts = can_reason_has_vision, },
+        ["mimo-v2-omni"] = { formatted_name = "Xiaomi MiMo-V2-Omni", opts = can_reason_has_vision, },
+        ["mimo-v2-flash"] = { formatted_name = "Xiaomi MiMo-V2-Flash", opts = can_reason_has_vision, },
+        ["mimo-v2.5"] = { formatted_name = "Xiaomi MiMo-V2.5", opts = can_reason_has_vision, },
+        ["kimi-k2.6"] = { formatted_name = "Kimi K2.6", opts = can_reason_has_vision, },
+        ["minimax-m2.7"] = { formatted_name = "MiniMax M2.7", opts = can_reason_has_vision, },
+        ["code:claude-opus-4-6-thinking"] = { formatted_name = "Claude Opus 4.6 (Code, Thinking)", opts = can_reason_has_vision, },
+        ["code:claude-opus-4-6"] = { formatted_name = "Claude Opus 4.6 (Code)", opts = can_reason_has_vision, },
+        ["code:claude-sonnet-4-6"] = { formatted_name = "Claude Sonnet 4.6 (Code)", opts = can_reason_has_vision, },
+        ["claude-haiku-4.5-thinking"] = { formatted_name = "Claude Haiku 4.5 (Thinking)", opts = can_reason_has_vision, },
+        ["claude-haiku-4-5"] = { formatted_name = "Claude Haiku 4.5", opts = can_reason_has_vision, },
+        ["code:claude-opus-4-5"] = { formatted_name = "Claude Opus 4.5 (Code)", opts = can_reason_has_vision, },
+        ["code:claude-sonnet-4-5"] = { formatted_name = "Claude Sonnet 4.5 (Code)", opts = can_reason_has_vision, },
+      },
+    },
+    ---@type CodeCompanion.Schema
+    extended_output = {
+      order = 2,
+      mapping = "temp",
+      type = "boolean",
+      optional = true,
+      default = false,
+      desc = "Enable larger output context (128k tokens). Only available with claude-3-7-sonnet-20250219.",
+      ---@param self CodeCompanion.HTTPAdapter
+      enabled = function(self)
+        local model = self.schema.model.default
+        if self.schema.model.choices[model] and self.schema.model.choices[model].opts then
+          return self.schema.model.choices[model].opts.can_reason
+        end
+        return false
+      end,
+    },
+    ---@type CodeCompanion.Schema
+    extended_thinking = {
+      order = 3,
+      mapping = "temp",
+      type = "boolean",
+      optional = true,
+      desc = "Enable extended thinking for more thorough reasoning. Requires thinking_budget to be set.",
+      default = function(self)
+        local model = self.schema.model
+        if
+          model.choices[model.default]
+          and model.choices[model.default].opts
+          and model.choices[model.default].opts.can_reason == true
+        then
+          return true
+        end
+        return false
+      end,
+      ---@param self CodeCompanion.HTTPAdapter
+      enabled = function(self)
+        local model = self.schema.model.default
+        if self.schema.model.choices[model] and self.schema.model.choices[model].opts then
+          return self.schema.model.choices[model].opts.can_reason
+        end
+        return false
+      end,
+    },
+    ---@type CodeCompanion.Schema
+    thinking_budget = {
+      order = 4,
+      mapping = "temp",
+      type = "number",
+      optional = true,
+      default = 16000,
+      desc = "The maximum number of tokens to use for thinking when extended_thinking is enabled. Must be less than max_tokens.",
+      validate = function(n)
+        return n > 0, "Must be greater than 0"
+      end,
+      ---@param self CodeCompanion.HTTPAdapter
+      enabled = function(self)
+        local model = self.schema.model.default
+        if self.schema.model.choices[model] and self.schema.model.choices[model].opts then
+          return self.schema.model.choices[model].opts.can_reason
+        end
+        return false
+      end,
+    },
+    ---@type CodeCompanion.Schema
+    max_tokens = {
+      order = 5,
+      mapping = "parameters",
+      type = "number",
+      optional = true,
+      default = function(self)
+        local model = self.schema.model.default
+        if
+          self.schema.model.choices[model]
+          and self.schema.model.choices[model].opts
+          and self.schema.model.choices[model].opts.can_reason
+        then
+          return self.schema.thinking_budget.default + 1000
+        end
+        return 4096
+      end,
+      desc = "The maximum number of tokens to generate before stopping. This parameter only specifies the absolute maximum number of tokens to generate. Different models have different maximum values for this parameter.",
+      validate = function(n)
+        return n > 0 and n <= 128000, "Must be between 0 and 128000"
+      end,
+    },
+    ---@type CodeCompanion.Schema
+    temperature = {
+      order = 6,
+      mapping = "parameters",
+      type = "number",
+      optional = true,
+      default = 0.2,
+      desc = "Amount of randomness injected into the response. Ranges from 0.0 to 1.0. Use temperature closer to 0.0 for analytical / multiple choice, and closer to 1.0 for creative and generative tasks. Note that even with temperature of 0.0, the results will not be fully deterministic.",
+      validate = function(n)
+        return n >= 0 and n <= 1, "Must be between 0 and 1.0"
+      end,
+    },
+    ---@type CodeCompanion.Schema
+    top_p = {
+      order = 7,
+      mapping = "parameters",
+      type = "number",
+      optional = true,
+      default = nil,
+      desc = "Computes the cumulative distribution over all the options for each subsequent token in decreasing probability order and cuts it off once it reaches a particular probability specified by top_p",
+      validate = function(n)
+        return n >= 0 and n <= 1, "Must be between 0 and 1"
+      end,
+    },
+    ---@type CodeCompanion.Schema
+    top_k = {
+      order = 8,
+      mapping = "parameters",
+      type = "number",
+      optional = true,
+      default = nil,
+      desc = "Only sample from the top K options for each subsequent token. Use top_k to remove long tail low probability responses",
+      validate = function(n)
+        return n >= 0, "Must be greater than 0"
+      end,
+    },
+    ---@type CodeCompanion.Schema
+    stop_sequences = {
+      order = 9,
+      mapping = "parameters",
+      type = "list",
+      optional = true,
+      default = nil,
+      subtype = {
+        type = "string",
+      },
+      desc = "Sequences where the API will stop generating further tokens",
+      validate = function(l)
+        return #l >= 1, "Must have more than 1 element"
+      end,
+    },
+  },
+}
