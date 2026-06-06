@@ -30,6 +30,7 @@ M.libraries = {
 
 M.adapters = {
   "anthropic",
+  "apertis",
   "ollama",
   "openai",
 }

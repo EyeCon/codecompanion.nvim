@@ -395,7 +395,15 @@ function UI:render(context, messages, opts)
         setting = setting(self.adapter)
       end
 
-      table.insert(lines, string.format("%s: %s", key, yaml.encode(setting)))
+      local key_schema = self.adapter.schema[key]
+      local key_str = key:find("%.") and ("\"" .. key .. "\"") or key
+      local value_str
+      if key_schema and key_schema.type == "ordered_choices" then
+        value_str = yaml.encode_compact(setting)
+      else
+        value_str = yaml.encode(setting)
+      end
+      table.insert(lines, string.format("%s: %s", key_str, value_str))
     end
     table.insert(lines, "---")
     spacer()

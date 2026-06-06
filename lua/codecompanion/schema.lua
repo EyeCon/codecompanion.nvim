@@ -1,6 +1,6 @@
 ---@class CodeCompanion.Schema
 ---@field default any The default value of the item
----@field type "string"|"number"|"integer"|"boolean"|"enum"|"list"|"map"
+---@field type "string"|"number"|"integer"|"boolean"|"enum"|"list"|"map"|"ordered_choices"
 ---@field mapping? string Where to map the item to the request
 ---@field order nil|integer The order to display the item when the full schema is shown
 ---@field optional nil|boolean
@@ -10,6 +10,8 @@
 ---@field validate? fun(value: any): boolean, nil|string
 
 local M = {}
+
+local islist = vim.islist or vim.tbl_islist
 
 ---Return the default values for a schema
 ---@param adapter CodeCompanion.HTTPAdapter
@@ -64,7 +66,38 @@ local function validate_type(schema, value, adapter)
     end
   elseif ptype == "list" then
     -- TODO validate subtype
-    return type(value) == "table" and vim.islist(value)
+    return type(value) == "table" and islist(value)
+  elseif ptype == "ordered_choices" then
+    if value == nil then
+      return schema.optional
+    end
+    if type(value) ~= "table" or not islist(value) then
+      return false, "must be a list"
+    end
+    local choices = schema.choices
+    if type(choices) == "function" then
+      choices = choices(adapter)
+    end
+    -- Build a set of valid choice strings (handles both dict and array format)
+    local valid_set = {}
+    for k, v in pairs(choices) do
+      if type(v) == "table" then
+        valid_set[k] = true
+      else
+        valid_set[v] = true
+      end
+    end
+    local seen = {}
+    for _, item in ipairs(value) do
+      if not valid_set[item] then
+        return false, string.format("invalid choice '%s'", item)
+      end
+      if seen[item] then
+        return false, string.format("duplicate choice '%s'", item)
+      end
+      seen[item] = true
+    end
+    return true
   elseif ptype == "map" then
     local valid = type(value) == "table" and (vim.tbl_isempty(value) or not vim.islist(value))
     -- TODO validate subtype and subtype_key

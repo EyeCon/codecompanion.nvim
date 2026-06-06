@@ -69,24 +69,82 @@ function M.settings(bufnr, parser, adapter)
   return settings
 end
 
+---Recursively walk a Tree-sitter tree to find block_mapping_pair nodes
+---containing the given row position
+---@param node TSNode
+---@param row number 0-indexed row
+---@param result table Accumulator for found pairs
+local function find_pairs_at_row(node, row, result)
+  for child in node:iter_children() do
+    if child:type() == "block_mapping_pair" then
+      local sr, _, er, _ = child:range()
+      if sr <= row and row <= er then
+        table.insert(result, child)
+      end
+    else
+      -- Recurse into intermediate nodes (stream, document, block_node, block_mapping, etc.)
+      local sr, _, er, _ = child:range()
+      if sr <= row and row <= er then
+        find_pairs_at_row(child, row, result)
+      end
+    end
+  end
+end
+
 ---Get the settings key at the current cursor position
 ---@param chat CodeCompanion.Chat
 ---@param opts? table
 function M.get_settings_key(chat, opts)
-  opts = vim.tbl_extend("force", opts or {}, {
-    lang = "yaml",
-    ignore_injections = false,
-  })
-  local node = vim.treesitter.get_node(opts)
-  while node and node:type() ~= "block_mapping_pair" do
-    node = node:parent()
+  opts = opts or {}
+  local cursor
+  if opts.pos then
+    cursor = opts.pos -- already 0-indexed
+  else
+    cursor = vim.api.nvim_win_get_cursor(0)
+    cursor[1] = cursor[1] - 1 -- convert from 1-indexed to 0-indexed
   end
-  if not node then
+  local row = cursor[1]
+  local col = cursor[2] or 0
+
+  -- Use the chat's dedicated YAML parser (which works in the injected region)
+  -- instead of vim.treesitter.get_node() which cannot traverse into injections
+  -- in a markdown buffer.
+  if not chat.parsers or not chat.parsers.yaml then
     return
   end
-  local key_node = node:named_child(0)
+
+  local root = chat.parsers.yaml:parse()[1]:root()
+
+  -- Recursively find all block_mapping_pair nodes on the cursor row
+  local pairs = {}
+  find_pairs_at_row(root, row, pairs)
+
+  if #pairs == 0 then
+    return
+  end
+
+  -- Pick the best match: the pair whose key column range contains col,
+  -- or the last pair on the row (most specific/innermost)
+  local best_node = nil
+  for _, pair in ipairs(pairs) do
+    local key_node = pair:named_child(0)
+    if key_node then
+      local _, ksc, _, kec = key_node:range()
+      if ksc <= col and col <= kec then
+        best_node = pair
+        break
+      end
+    end
+    best_node = pair
+  end
+
+  local key_node = best_node:named_child(0)
   local key_name = get_node_text(key_node, chat.bufnr)
-  return key_name, node
+  -- Strip surrounding quotes from quoted YAML keys (e.g. "provider.order")
+  if key_name then
+    key_name = key_name:match('^"(.+)"$') or key_name:match("^'(.+)'$") or key_name
+  end
+  return key_name, best_node
 end
 
 ---Parse the chat buffer for the last message
