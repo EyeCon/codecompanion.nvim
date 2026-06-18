@@ -47,6 +47,24 @@ M.encode = function(data)
   end
 end
 
+---Encode a list as a compact flow sequence [a, b, c] instead of block sequence
+---This produces single-line YAML that works correctly with the header rendering
+---@param data any
+---@return string
+M.encode_compact = function(data)
+  if type(data) ~= "table" or not islist(data) then
+    return M.encode(data)
+  end
+  if vim.tbl_isempty(data) then
+    return "[]"
+  end
+  local items = {}
+  for _, v in ipairs(data) do
+    table.insert(items, M.encode(v))
+  end
+  return "[" .. table.concat(items, ", ") .. "]"
+end
+
 ---Decode a yaml node
 ---@param source string
 ---@param node TSNode

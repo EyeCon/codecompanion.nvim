@@ -72,6 +72,7 @@ local helpers = require("codecompanion.interactions.chat.helpers")
 local parser = require("codecompanion.interactions.chat.parser")
 local schema = require("codecompanion.schema")
 local tags = require("codecompanion.interactions.shared.tags")
+local yaml = require("codecompanion.utils.yaml")
 
 local hash = require("codecompanion.utils.hash")
 local images_utils = require("codecompanion.utils.images")
@@ -863,7 +864,16 @@ function Chat:complete_models(callback)
   end
 
   local key_schema = self.adapter.schema[key_name]
-  if key_schema.type == "enum" then
+  if not key_schema then
+    callback({ items = items, isIncomplete = false })
+    return
+  end
+
+  if key_schema.type == "ordered_choices" then
+    self:open_ordered_choices_picker(key_name, key_schema)
+    callback({ items = items, isIncomplete = false })
+    return
+  elseif key_schema.type == "enum" then
     local choices = key_schema.choices
     if type(choices) == "function" then
       choices = choices(self.adapter)
@@ -877,6 +887,179 @@ function Chat:complete_models(callback)
   end
 
   callback({ items = items, isIncomplete = false })
+end
+
+---Open a picker for an ordered_choices schema field
+---Picking an active item removes it; picking an inactive item appends it to the end
+---@param key_name string
+---@param key_schema CodeCompanion.Schema
+function Chat:open_ordered_choices_picker(key_name, key_schema)
+  key_schema = key_schema or self.adapter.schema[key_name]
+  if not key_schema then
+    vim.notify(
+      string.format("[codecompanion] No schema found for key '%s'", key_name),
+      vim.log.levels.ERROR
+    )
+    return
+  end
+
+  local choices = key_schema.choices
+  if type(choices) == "function" then
+    choices = choices(self.adapter)
+  end
+
+  -- Build display map and ordered values from choices (handles both dict and array format)
+  -- Dict format: {["slug"] = {formatted_name = "Display Name"}} → shows "Display Name", value is "slug"
+  -- Array format: {"a", "b"} → shows "a", value is "a"
+  local display_map = {}
+  local all_choices = {}
+  for k, v in pairs(choices) do
+    if type(v) == "table" then
+      display_map[k] = v.formatted_name or k
+      table.insert(all_choices, k)
+    else
+      display_map[v] = v
+      table.insert(all_choices, v)
+    end
+  end
+  table.sort(all_choices, function(a, b)
+    return (display_map[a] or a):lower() < (display_map[b] or b):lower()
+  end)
+
+  -- Read the current value from the buffer (always fresh)
+  local settings = parser.settings(self.bufnr, self.parsers.yaml, self.adapter)
+  local current = settings[key_name] or {}
+  if type(current) ~= "table" then
+    current = {}
+  end
+
+  local current_set = {}
+  for _, v in ipairs(current) do
+    current_set[v] = true
+  end
+
+  -- Build picker items: active items first (in their current order), then inactive
+  local picker_items = {}
+
+  -- Active items (selecting removes them)
+  for _, v in ipairs(current) do
+    table.insert(picker_items, {
+      label = "☑ " .. (display_map[v] or v),
+      value = v,
+      action = "remove",
+    })
+  end
+
+  -- Separator if both groups are non-empty
+  if #current > 0 then
+    local has_unselected = false
+    for _, v in ipairs(all_choices) do
+      if not current_set[v] then
+        has_unselected = true
+        break
+      end
+    end
+    if has_unselected then
+      table.insert(picker_items, {
+        label = "── append ──",
+        value = nil,
+        action = "separator",
+      })
+    end
+  end
+
+  -- Inactive items (selecting appends them), sorted alphabetically by display name
+  for _, v in ipairs(all_choices) do
+    if not current_set[v] then
+      table.insert(picker_items, {
+        label = "☐ " .. (display_map[v] or v),
+        value = v,
+        action = "append",
+      })
+    end
+  end
+
+  vim.ui.select(picker_items, {
+    prompt = string.format("%s (select ☑ to remove, ☐ to append):", key_name),
+    format_item = function(item)
+      return item.label
+    end,
+  }, function(selected)
+    if not selected or not selected.value then
+      return
+    end
+
+    local new_value
+    if selected.action == "remove" then
+      new_value = vim.tbl_filter(function(v)
+        return v ~= selected.value
+      end, current)
+    elseif selected.action == "append" then
+      new_value = vim.list_extend(vim.deepcopy(current), { selected.value })
+    end
+
+    self:update_setting(key_name, new_value)
+  end)
+end
+
+---Update a single setting value in the YAML frontmatter
+---@param key_name string
+---@param value any
+function Chat:update_setting(key_name, value)
+  if self.adapter.type ~= "http" then
+    return
+  end
+
+  -- Find the YAML frontmatter boundaries
+  local lines = api.nvim_buf_get_lines(self.bufnr, 0, -1, false)
+  local yaml_start = nil
+  local yaml_end = nil
+
+  for i, line in ipairs(lines) do
+    if line == "---" then
+      if not yaml_start then
+        yaml_start = i
+      else
+        yaml_end = i
+        break
+      end
+    end
+  end
+
+  if not yaml_start or not yaml_end then
+    return
+  end
+
+  -- Read current settings from the buffer
+  local settings = parser.settings(self.bufnr, self.parsers.yaml, self.adapter)
+
+  -- Update the specific key
+  settings[key_name] = value
+
+  -- Re-render the entire YAML frontmatter
+  local new_yaml_lines = { "---" }
+  local keys = schema.get_ordered_keys(self.adapter)
+  for _, key in ipairs(keys) do
+    local setting = settings[key]
+    if type(setting) == "function" then
+      setting = setting(self.adapter)
+    end
+    local ks = self.adapter.schema[key]
+    local key_str = key:find("%.") and ("\"" .. key .. "\"") or key
+    if ks and ks.type == "ordered_choices" then
+      table.insert(new_yaml_lines, string.format("%s: %s", key_str, yaml.encode_compact(setting)))
+    else
+      table.insert(new_yaml_lines, string.format("%s: %s", key_str, yaml.encode(setting)))
+    end
+  end
+  table.insert(new_yaml_lines, "---")
+
+  -- Replace the old frontmatter with the new one
+  -- (yaml_start and yaml_end are 1-indexed; nvim_buf_set_lines is 0-indexed)
+  api.nvim_buf_set_lines(self.bufnr, yaml_start - 1, yaml_end, false, new_yaml_lines)
+
+  -- Update internal state
+  self.settings = settings
 end
 
 ---@class CodeCompanion.SystemPrompt.Context
