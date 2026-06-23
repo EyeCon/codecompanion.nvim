@@ -1476,6 +1476,7 @@ M.setup = function(args)
       spacing = 2,
       severity = { min = vim.diagnostic.severity.INFO },
     },
+    virtual_lines = false,
     signs = false,
   }
   vim.diagnostic.config(diagnostic_config, M.config.INFO_NS)
