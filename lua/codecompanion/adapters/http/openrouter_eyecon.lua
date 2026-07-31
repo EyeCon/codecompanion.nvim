@@ -167,41 +167,41 @@ return require("codecompanion.adapters").extend("openai", {
       end,
     },
     ---@type CodeCompanion.Schema
-    repetition_penalty = {
-      order = 12,
-      mapping = "parameters",
-      type = "number",
-      optional = true,
-      default = nil,
-      desc = "Helps to reduce the repetition of tokens from the input. A higher value makes the model less likely to repeat tokens, but too high a value can make the output less coherent. Token penalty scales based on original token's probability.",
-      validate = function(n)
-        return n >= 0 and n <= 2, "Must be between 0 and 2"
-      end,
-    },
+    -- repetition_penalty = {
+    --   order = 12,
+    --   mapping = "parameters",
+    --   type = "number",
+    --   optional = true,
+    --   default = nil,
+    --   desc = "Helps to reduce the repetition of tokens from the input. A higher value makes the model less likely to repeat tokens, but too high a value can make the output less coherent. Token penalty scales based on original token's probability.",
+    --   validate = function(n)
+    --     return n >= 0 and n <= 2, "Must be between 0 and 2"
+    --   end,
+    -- },
     ---@type CodeCompanion.Schema
-    min_p = {
-      order = 13,
-      mapping = "parameters",
-      type = "number",
-      optional = true,
-      default = nil,
-      desc = "Represents the minimum probability for a token to be considered, relative to the probability of the most likely token. If Min-P is set to 0.1, only tokens at least 1/10th as probable as the best option are considered.",
-      validate = function(n)
-        return n >= 0 and n <= 1, "Must be between 0 and 1"
-      end,
-    },
+    -- min_p = {
+    --   order = 13,
+    --   mapping = "parameters",
+    --   type = "number",
+    --   optional = true,
+    --   default = nil,
+    --   desc = "Represents the minimum probability for a token to be considered, relative to the probability of the most likely token. If Min-P is set to 0.1, only tokens at least 1/10th as probable as the best option are considered.",
+    --   validate = function(n)
+    --     return n >= 0 and n <= 1, "Must be between 0 and 1"
+    --   end,
+    -- },
     ---@type CodeCompanion.Schema
-    top_a = {
-      order = 14,
-      mapping = "parameters",
-      type = "number",
-      optional = true,
-      default = nil,
-      desc = "Consider only the top tokens with sufficiently high probabilities based on the probability of the most likely token. Think of it like a dynamic Top-P. A lower value focuses choices based on the highest probability token but with a narrower scope.",
-      validate = function(n)
-        return n >= 0 and n <= 1, "Must be between 0 and 1"
-      end,
-    },
+    -- top_a = {
+    --   order = 14,
+    --   mapping = "parameters",
+    --   type = "number",
+    --   optional = true,
+    --   default = nil,
+    --   desc = "Consider only the top tokens with sufficiently high probabilities based on the probability of the most likely token. Think of it like a dynamic Top-P. A lower value focuses choices based on the highest probability token but with a narrower scope.",
+    --   validate = function(n)
+    --     return n >= 0 and n <= 1, "Must be between 0 and 1"
+    --   end,
+    -- },
     ---@type CodeCompanion.Schema
     max_completion_tokens = {
       order = 15,
