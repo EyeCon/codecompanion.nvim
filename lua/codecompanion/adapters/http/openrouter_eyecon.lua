@@ -133,6 +133,11 @@ return require("codecompanion.adapters").extend("openai", {
     models_endpoint = "/v1/models",
   },
   url = "${url}${chat_url}",
+  headers = {
+    ["HTTP-Referer"] = "https://codecompanion.olimorris.dev/",
+    ["X-OpenRouter-Title"] = "CodeCompanion",
+    ["X-OpenRouter-Categories"] = "ide-extension",
+  },
   schema = {
     ---@type CodeCompanion.Schema
     model = {
